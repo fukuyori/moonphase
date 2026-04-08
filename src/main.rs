@@ -666,6 +666,17 @@ fn separator(lang: Language) -> &'static str {
     }
 }
 
+fn display_width(text: &str) -> usize {
+    text.chars()
+        .map(|ch| if ch.is_ascii() { 1 } else { 2 })
+        .sum()
+}
+
+fn padded_label(label: &str, width: usize) -> String {
+    let padding = width.saturating_sub(display_width(label));
+    format!("{}{}", label, " ".repeat(padding))
+}
+
 /// 明るさ (0.0〜1.0) をグラデーション文字に変換（月面用・高精細）
 fn shade_char_moon(brightness: f64) -> char {
     match brightness {
@@ -828,18 +839,55 @@ fn main() {
 
     // フッター情報
     let sep = separator(lang);
-    println!("    {:<9}{} {:.2} {}", label(lang, "age"), sep, age, label(lang, "days"));
-    println!("    {:<9}{} {:.1}%", label(lang, "illumination"), sep, illum);
-    println!("    {:<9}{} {}", label(lang, "phase"), sep, name);
-    println!("    {:<9}{} {:.0} km", label(lang, "distance"), sep, distance);
+    let label_width = match lang {
+        Language::Ja => 10,
+        Language::En => 9,
+    };
+    println!(
+        "    {}{} {:.2} {}",
+        padded_label(label(lang, "age"), label_width),
+        sep,
+        age,
+        label(lang, "days")
+    );
+    println!(
+        "    {}{} {:.1}%",
+        padded_label(label(lang, "illumination"), label_width),
+        sep,
+        illum
+    );
+    println!(
+        "    {}{} {}",
+        padded_label(label(lang, "phase"), label_width),
+        sep,
+        name
+    );
+    println!(
+        "    {}{} {:.0} km",
+        padded_label(label(lang, "distance"), label_width),
+        sep,
+        distance
+    );
     let (sunrise, sunset) = sunrise_sunset_local_on_date(year, month, day, lat, lon, tz_offset);
     if let (Some((sr_h, sr_m)), Some((ss_h, ss_m))) = (sunrise, sunset) {
-        println!("    {:<9}{} {:02}:{:02} JST", label(lang, "sunrise"), sep, sr_h, sr_m);
-        println!("    {:<9}{} {:02}:{:02} JST", label(lang, "sunset"), sep, ss_h, ss_m);
+        println!(
+            "    {}{} {:02}:{:02} JST",
+            padded_label(label(lang, "sunrise"), label_width),
+            sep,
+            sr_h,
+            sr_m
+        );
+        println!(
+            "    {}{} {:02}:{:02} JST",
+            padded_label(label(lang, "sunset"), label_width),
+            sep,
+            ss_h,
+            ss_m
+        );
     } else {
         println!(
-            "    {:<9}{} {}",
-            label(lang, "sunrise_sunset_none"),
+            "    {}{} {}",
+            padded_label(label(lang, "sunrise_sunset_none"), label_width),
             sep,
             label(lang, "sunrise_sunset_none_value")
         );
@@ -864,11 +912,22 @@ fn main() {
     present_events.sort_by_key(|(_, h, m)| (*h, *m));
 
     for (label, h, m) in &present_events {
-        println!("    {:<9}{} {:02}:{:02} JST", label, sep, h, m);
+        println!(
+            "    {}{} {:02}:{:02} JST",
+            padded_label(label, label_width),
+            sep,
+            h,
+            m
+        );
     }
     for (label, time) in &moon_events {
         if time.is_none() {
-            println!("    {:<9}{} {}", label, sep, fmt_moon(*time));
+            println!(
+                "    {}{} {}",
+                padded_label(label, label_width),
+                sep,
+                fmt_moon(*time)
+            );
         }
     }
 
