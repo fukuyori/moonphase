@@ -1,0 +1,13 @@
+[package]
+name = "moonphase"
+version = "0.9.0"
+edition = "2021"
+description = "CLI tool for moon phase, rise/set, and ASCII moon art"
+
+[[bin]]
+name = "moon"
+path = "src/main.rs"
+
+[dependencies]
+astro = "2"
+chrono = "0.4"
