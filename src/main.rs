@@ -16,6 +16,8 @@ const DEFAULT_LAT: f64 = 35.6762;
 const DEFAULT_LON: f64 = 139.6503;
 const JST_OFFSET_HOURS: f64 = 9.0;
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+const PERIGEE_KM: f64 = 356_400.0;
+const APOGEE_KM: f64 = 406_700.0;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Language {
@@ -29,6 +31,7 @@ struct AppConfig {
     lon: f64,
     art: bool,
     lang: Language,
+    tz_offset_minutes: i32,
 }
 
 fn date_to_jd(year: i32, month: u32, day: u32) -> f64 {
@@ -59,12 +62,50 @@ fn parse_language(value: &str) -> Result<Language, String> {
     }
 }
 
+fn parse_tz_offset(value: &str) -> Result<i32, String> {
+    if value == "Z" || value.eq_ignore_ascii_case("UTC") {
+        return Ok(0);
+    }
+
+    let Some(first) = value.chars().next() else {
+        return Err("timezone must be in the form `09:00`, `+09:00`, or `-05:00`".to_string());
+    };
+    let (sign, rest) = match first {
+        '+' => (1, &value[1..]),
+        '-' => (-1, &value[1..]),
+        _ => (1, value),
+    };
+    let Some((hour_s, minute_s)) = rest.split_once(':') else {
+        return Err("timezone must be in the form `09:00`, `+09:00`, or `-05:00`".to_string());
+    };
+    let hours: i32 = hour_s.parse().map_err(|_| "invalid timezone hour".to_string())?;
+    let minutes: i32 = minute_s.parse().map_err(|_| "invalid timezone minute".to_string())?;
+    if hours > 23 || minutes > 59 {
+        return Err("timezone is out of range".to_string());
+    }
+    let total = hours * 60 + minutes;
+    Ok(sign * total)
+}
+
+fn fixed_offset_from_minutes(tz_offset_minutes: i32) -> FixedOffset {
+    FixedOffset::east_opt(tz_offset_minutes * 60).expect("valid timezone offset")
+}
+
+fn format_tz_label(tz_offset_minutes: i32) -> String {
+    if tz_offset_minutes == 0 {
+        return "UTC".to_string();
+    }
+    let sign = if tz_offset_minutes < 0 { '-' } else { '+' };
+    let abs = tz_offset_minutes.abs();
+    format!("UTC{}{:02}:{:02}", sign, abs / 60, abs % 60)
+}
+
 fn print_usage(exit_code: i32) -> ! {
     println!("moon {}", VERSION);
     println!();
     println!("Usage:");
     println!("  moon [YYYY-MM-DD|today|prev|next] [LAT LON]");
-    println!("  moon --date [YYYY-MM-DD|today|prev|next] --lat LAT --lon LON [--art|--no-art] [--lang ja|en]");
+    println!("  moon --date [YYYY-MM-DD|today|prev|next] --lat LAT --lon LON [--art|--no-art] [--lang ja|en] [--tz 09:00]");
     println!("  moon --help");
     println!("  moon --version");
     if let Some(path) = default_config_path() {
@@ -75,6 +116,7 @@ fn print_usage(exit_code: i32) -> ! {
         println!("  lon = 139.6503");
         println!("  art = true");
         println!("  lang = \"ja\"");
+        println!("  tz = \"09:00\"");
     }
     std::process::exit(exit_code);
 }
@@ -119,6 +161,7 @@ fn parse_app_config(content: &str) -> Result<AppConfig, String> {
     let mut lon = None;
     let mut art = None;
     let mut lang = None;
+    let mut tz_offset_minutes = None;
 
     for raw_line in content.lines() {
         let line = raw_line.split('#').next().unwrap_or("").trim();
@@ -157,6 +200,9 @@ fn parse_app_config(content: &str) -> Result<AppConfig, String> {
             "lang" => {
                 lang = Some(parse_language(value)?);
             }
+            "tz" => {
+                tz_offset_minutes = Some(parse_tz_offset(value)?);
+            }
             _ => {}
         }
     }
@@ -167,6 +213,7 @@ fn parse_app_config(content: &str) -> Result<AppConfig, String> {
             lon,
             art: art.unwrap_or(true),
             lang: lang.unwrap_or(Language::Ja),
+            tz_offset_minutes: tz_offset_minutes.unwrap_or((JST_OFFSET_HOURS * 60.0) as i32),
         }),
         (None, None) => Err("config.toml is missing `lat` and `lon`".to_string()),
         (None, Some(_)) => Err("config.toml is missing `lat`".to_string()),
@@ -189,16 +236,36 @@ fn load_app_config() -> Result<Option<AppConfig>, String> {
     Ok(Some(config))
 }
 
+fn detect_cli_tz_offset(args: &[String], default_tz_offset_minutes: i32) -> Result<i32, String> {
+    let mut tz_offset_minutes = default_tz_offset_minutes;
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--tz" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("missing value for `--tz`".to_string());
+                }
+                tz_offset_minutes = parse_tz_offset(&args[i])?;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    Ok(tz_offset_minutes)
+}
+
 fn parse_cli_args(
     args: &[String],
     base_date: NaiveDate,
     default_config: AppConfig,
-) -> Result<(NaiveDate, f64, f64, bool, Language), String> {
+) -> Result<(NaiveDate, f64, f64, bool, Language, i32), String> {
     let mut date = base_date;
     let mut lat = default_config.lat;
     let mut lon = default_config.lon;
     let mut art = default_config.art;
     let mut lang = default_config.lang;
+    let mut tz_offset_minutes = default_config.tz_offset_minutes;
 
     let mut positional = Vec::new();
     let mut i = 1;
@@ -236,6 +303,13 @@ fn parse_cli_args(
                 }
                 lang = parse_language(&args[i])?;
             }
+            "--tz" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("missing value for `--tz`".to_string());
+                }
+                tz_offset_minutes = parse_tz_offset(&args[i])?;
+            }
             "--art" => {
                 art = true;
             }
@@ -269,17 +343,148 @@ fn parse_cli_args(
         _ => return Err("invalid number of arguments".to_string()),
     }
 
-    Ok((date, lat, lon, art, lang))
+    Ok((date, lat, lon, art, lang, tz_offset_minutes))
 }
 
 /// スーパームーン判定
 /// 満月（月齢14〜16付近）かつ近地点付近（距離の下位10%以内）
 fn is_supermoon(age: f64, distance: f64) -> bool {
     let is_full = (age - SYNODIC_MONTH / 2.0).abs() < 1.5;
-    let perigee = 356_400.0;
-    let apogee = 406_700.0;
-    let threshold = perigee + (apogee - perigee) * 0.10;
+    let threshold = PERIGEE_KM + (APOGEE_KM - PERIGEE_KM) * 0.10;
     is_full && distance < threshold
+}
+
+fn is_micromoon(age: f64, distance: f64) -> bool {
+    let is_full = (age - SYNODIC_MONTH / 2.0).abs() < 1.5;
+    let threshold = APOGEE_KM - (APOGEE_KM - PERIGEE_KM) * 0.10;
+    is_full && distance > threshold
+}
+
+fn nearest_full_moon_jd(date: NaiveDate, tz_offset_hours: f64) -> f64 {
+    let probe_dates = [
+        date + Duration::days(-20),
+        date,
+        date + Duration::days(20),
+    ];
+    let mut candidates = Vec::new();
+    for probe in probe_dates {
+        let probe_date = Date {
+            year: probe.year() as i16,
+            month: probe.month() as u8,
+            decimal_day: probe.day() as f64,
+            cal_type: CalType::Gregorian,
+        };
+        let full_jd = lunar::time_of_phase(&probe_date, &lunar::Phase::Full);
+        if !candidates.iter().any(|existing: &f64| (existing - full_jd).abs() < 0.1) {
+            candidates.push(full_jd);
+        }
+    }
+
+    candidates
+        .into_iter()
+        .min_by(|a, b| {
+            let date_jd = local_midnight_jd(date.year(), date.month(), date.day(), tz_offset_hours);
+            (a - date_jd).abs().total_cmp(&(b - date_jd).abs())
+        })
+        .expect("at least one full moon candidate")
+}
+
+fn jd_to_local_date(jd: f64, tz_offset_hours: f64) -> NaiveDate {
+    let jd = jd + tz_offset_hours / 24.0 + 0.5;
+    let z = jd.floor() as i64;
+    let f = jd - z as f64;
+
+    let mut a = z;
+    if z >= 2_299_161 {
+        let alpha = (((z as f64) - 1_867_216.25) / 36_524.25).floor() as i64;
+        a = z + 1 + alpha - alpha / 4;
+    }
+    let b = a + 1524;
+    let c = (((b as f64) - 122.1) / 365.25).floor() as i64;
+    let d = (365.25 * c as f64).floor() as i64;
+    let e = (((b - d) as f64) / 30.6001).floor() as i64;
+
+    let day = b - d - (30.6001 * e as f64).floor() as i64;
+    let month = if e < 14 { e - 1 } else { e - 13 };
+    let year = if month > 2 { c - 4716 } else { c - 4715 };
+
+    let mut date = NaiveDate::from_ymd_opt(year as i32, month as u32, day as u32)
+        .expect("valid gregorian date");
+    if f >= 1.0 {
+        date += Duration::days(1);
+    }
+    date
+}
+
+fn is_blue_moon(date: NaiveDate, current_full_jd: f64, tz_offset_hours: f64) -> bool {
+    let current_full_date = jd_to_local_date(current_full_jd, tz_offset_hours);
+    if current_full_date.year() != date.year() || current_full_date.month() != date.month() {
+        return false;
+    }
+
+    let probe_dates = [
+        date + Duration::days(-20),
+        date,
+        date + Duration::days(20),
+    ];
+    let mut candidates = Vec::new();
+    for probe in probe_dates {
+        let probe_date = Date {
+            year: probe.year() as i16,
+            month: probe.month() as u8,
+            decimal_day: probe.day() as f64,
+            cal_type: CalType::Gregorian,
+        };
+        let full_jd = lunar::time_of_phase(&probe_date, &lunar::Phase::Full);
+        if !candidates.iter().any(|existing: &f64| (existing - full_jd).abs() < 0.1) {
+            candidates.push(full_jd);
+        }
+    }
+
+    let fulls_in_month = candidates
+        .iter()
+        .copied()
+        .filter(|candidate| {
+            let local_date = jd_to_local_date(*candidate, tz_offset_hours);
+            local_date.year() == date.year() && local_date.month() == date.month()
+        })
+        .count();
+
+    fulls_in_month >= 2
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum MoonEvent {
+    BlueMoon,
+    SuperMoon,
+    MicroMoon,
+}
+
+fn detect_moon_events(date: NaiveDate, tz_offset_hours: f64) -> Vec<MoonEvent> {
+    let mut events = Vec::new();
+    let full_jd = nearest_full_moon_jd(date, tz_offset_hours);
+    let full_date = jd_to_local_date(full_jd, tz_offset_hours);
+    let day_delta = (date - full_date).num_days().abs();
+
+    if day_delta <= 1 {
+        let (full_age, _, full_distance) = lunar_metrics(
+            full_jd,
+            full_date.year(),
+            full_date.month(),
+            full_date.day(),
+        );
+
+        if is_blue_moon(full_date, full_jd, tz_offset_hours) {
+            events.push(MoonEvent::BlueMoon);
+        }
+        if is_supermoon(full_age, full_distance) {
+            events.push(MoonEvent::SuperMoon);
+        }
+        if is_micromoon(full_age, full_distance) {
+            events.push(MoonEvent::MicroMoon);
+        }
+    }
+    events
 }
 
 /// astro クレートを使って月の赤道座標と距離を取得
@@ -532,13 +737,66 @@ fn sunrise_sunset_local_on_date(
     (sunrise, sunset)
 }
 
+#[derive(Clone, Copy)]
+enum Body {
+    Sun,
+    Moon,
+}
+
+fn normalize_angle(angle: f64) -> f64 {
+    angle.rem_euclid(2.0 * PI)
+}
+
+fn local_sidereal_time(jd: f64, lon_deg: f64) -> f64 {
+    normalize_angle(apprnt_sidr!(jd) + lon_deg.to_radians())
+}
+
+fn azimuth_from_eq(eq: coords::EqPoint, lat_deg: f64, lon_deg: f64, jd: f64) -> f64 {
+    let lat = lat_deg.to_radians();
+    let hour_angle = normalize_angle(local_sidereal_time(jd, lon_deg) - eq.asc);
+
+    let y = -(eq.dec.cos() * hour_angle.sin());
+    let x = eq.dec.sin() * lat.cos() - eq.dec.cos() * lat.sin() * hour_angle.cos();
+
+    normalize_angle(y.atan2(x)).to_degrees()
+}
+
+fn event_azimuth(
+    body: Body,
+    date: NaiveDate,
+    hm: (u32, u32),
+    lat_deg: f64,
+    lon_deg: f64,
+    tz_offset_hours: f64,
+) -> f64 {
+    let jd = local_midnight_jd(date.year(), date.month(), date.day(), tz_offset_hours)
+        + hm.0 as f64 / 24.0
+        + hm.1 as f64 / 1_440.0;
+    let eq = match body {
+        Body::Sun => solar_eq_pos(jd),
+        Body::Moon => lunar_eq_pos(jd).0,
+    };
+    azimuth_from_eq(eq, lat_deg, lon_deg, jd)
+}
+
+fn format_event_with_azimuth(
+    hm: (u32, u32),
+    azimuth_deg: f64,
+    lang: Language,
+) -> String {
+    match lang {
+        Language::Ja => format!("{:02}:{:02}（{:03.0}°）", hm.0, hm.1, azimuth_deg),
+        Language::En => format!("{:02}:{:02} ({:03.0}°)", hm.0, hm.1, azimuth_deg),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use chrono::NaiveDate;
 
     use super::{
-        date_to_jd, moonrise_moonset_local_on_date, parse_app_config, parse_language,
-        resolve_date_spec, AppConfig, Language,
+        date_to_jd, format_event_with_azimuth, moon_art_color, moonrise_moonset_local_on_date,
+        parse_app_config, parse_language, resolve_date_spec, AppConfig, Language, MoonEvent,
         sunrise_sunset_local_on_date,
     };
 
@@ -576,7 +834,7 @@ mod tests {
     #[test]
     fn app_config_parses_lat_lon_and_art() {
         let config =
-            parse_app_config("lat = 34.6937\nlon = 135.5023\nart = false\nlang = \"en\"\n")
+            parse_app_config("lat = 34.6937\nlon = 135.5023\nart = false\nlang = \"en\"\ntz = \"+00:00\"\n")
                 .unwrap();
         assert_eq!(
             config,
@@ -585,6 +843,7 @@ mod tests {
                 lon: 135.5023,
                 art: false,
                 lang: Language::En,
+                tz_offset_minutes: 0,
             }
         );
     }
@@ -593,6 +852,27 @@ mod tests {
     fn parse_language_supports_ja_and_en() {
         assert_eq!(parse_language("ja").unwrap(), Language::Ja);
         assert_eq!(parse_language("en").unwrap(), Language::En);
+    }
+
+    #[test]
+    fn format_event_with_azimuth_shows_degrees_only() {
+        assert_eq!(
+            format_event_with_azimuth((5, 20), 81.2, Language::Ja),
+            "05:20（081°）"
+        );
+        assert_eq!(
+            format_event_with_azimuth((18, 8), 279.6, Language::En),
+            "18:08 (280°)"
+        );
+    }
+
+    #[test]
+    fn moon_art_color_prefers_blue_over_other_events() {
+        assert_eq!(
+            moon_art_color(&[MoonEvent::SuperMoon, MoonEvent::BlueMoon]),
+            Some("\x1b[94m")
+        );
+        assert_eq!(moon_art_color(&[MoonEvent::MicroMoon]), Some("\x1b[96m"));
     }
 }
 
@@ -637,6 +917,8 @@ fn label(lang: Language, key: &str) -> &'static str {
         (Language::Ja, "illumination") => "照明率",
         (Language::Ja, "phase") => "月相",
         (Language::Ja, "distance") => "距離",
+        (Language::Ja, "timezone") => "時差",
+        (Language::Ja, "event") => "イベント",
         (Language::Ja, "sunrise") => "日の出",
         (Language::Ja, "sunset") => "日の入",
         (Language::Ja, "sunrise_sunset_none") => "日の出/日の入",
@@ -648,6 +930,8 @@ fn label(lang: Language, key: &str) -> &'static str {
         (Language::En, "illumination") => "Illum.",
         (Language::En, "phase") => "Phase",
         (Language::En, "distance") => "Distance",
+        (Language::En, "timezone") => "Timezone",
+        (Language::En, "event") => "Event",
         (Language::En, "sunrise") => "Sunrise",
         (Language::En, "sunset") => "Sunset",
         (Language::En, "sunrise_sunset_none") => "Sunrise/Sunset",
@@ -675,6 +959,29 @@ fn display_width(text: &str) -> usize {
 fn padded_label(label: &str, width: usize) -> String {
     let padding = width.saturating_sub(display_width(label));
     format!("{}{}", label, " ".repeat(padding))
+}
+
+fn moon_event_name(event: MoonEvent, lang: Language) -> &'static str {
+    match (event, lang) {
+        (MoonEvent::BlueMoon, Language::Ja) => "ブルームーン",
+        (MoonEvent::SuperMoon, Language::Ja) => "スーパームーン",
+        (MoonEvent::MicroMoon, Language::Ja) => "マイクロムーン",
+        (MoonEvent::BlueMoon, Language::En) => "Blue Moon",
+        (MoonEvent::SuperMoon, Language::En) => "Supermoon",
+        (MoonEvent::MicroMoon, Language::En) => "Micromoon",
+    }
+}
+
+fn moon_art_color(events: &[MoonEvent]) -> Option<&'static str> {
+    if events.contains(&MoonEvent::BlueMoon) {
+        Some("\x1b[94m")
+    } else if events.contains(&MoonEvent::SuperMoon) {
+        Some("\x1b[93m")
+    } else if events.contains(&MoonEvent::MicroMoon) {
+        Some("\x1b[96m")
+    } else {
+        None
+    }
 }
 
 /// 明るさ (0.0〜1.0) をグラデーション文字に変換（月面用・高精細）
@@ -792,10 +1099,6 @@ fn main() {
     //   moon [YYYY-MM-DD|today|prev|next] [緯度 経度]
     //   moon --date 2026-04-08 --lat 35.68 --lon 139.77
     let args: Vec<String> = std::env::args().collect();
-    let tz_offset: f64 = JST_OFFSET_HOURS;
-    let jst = FixedOffset::east_opt((tz_offset * 3600.0) as i32)
-        .expect("valid JST offset");
-    let today_jst = Utc::now().with_timezone(&jst).date_naive();
     let default_config = match load_app_config() {
         Ok(Some(config)) => config,
         Ok(None) => AppConfig {
@@ -803,36 +1106,54 @@ fn main() {
             lon: DEFAULT_LON,
             art: true,
             lang: Language::Ja,
+            tz_offset_minutes: (JST_OFFSET_HOURS * 60.0) as i32,
         },
         Err(message) => {
             eprintln!("{}", message);
             std::process::exit(1);
         }
     };
-    let (date, lat, lon, art_enabled, lang) = match parse_cli_args(&args, today_jst, default_config) {
-        Ok(values) => values,
+    let tz_offset_minutes = match detect_cli_tz_offset(&args, default_config.tz_offset_minutes) {
+        Ok(value) => value,
         Err(message) => {
             eprintln!("{}", message);
             print_usage(1);
         }
     };
+    let local_tz = fixed_offset_from_minutes(tz_offset_minutes);
+    let today_local = Utc::now().with_timezone(&local_tz).date_naive();
+    let (date, lat, lon, art_enabled, lang, tz_offset_minutes) =
+        match parse_cli_args(&args, today_local, default_config) {
+        Ok(values) => values,
+        Err(message) => {
+            eprintln!("{}", message);
+            print_usage(1);
+        }
+        };
     let year = date.year();
     let month = date.month();
     let day = date.day();
-
+    let target_date = NaiveDate::from_ymd_opt(year, month, day).expect("valid date");
+    let tz_offset = tz_offset_minutes as f64 / 60.0;
+    let tz_label = format_tz_label(tz_offset_minutes);
     let jd = local_midnight_jd(year, month, day, tz_offset);
     let (age, illum_frac, distance) = lunar_metrics(jd, year, month, day);
     let illum = illum_frac * 100.0;
     let name = phase_name(age, lang);
-    let supermoon = is_supermoon(age, distance);
+    let special_events = detect_moon_events(target_date, tz_offset);
 
     println!();
 
     if art_enabled {
         // アスキーアート（45×21）
         let art = draw_moon(age, 45, 21);
+        let color = moon_art_color(&special_events);
         for line in &art {
-            println!("    {}", line);
+            if let Some(color) = color {
+                println!("    {}{}\x1b[0m", color, line);
+            } else {
+                println!("    {}", line);
+            }
         }
         println!();
     }
@@ -843,6 +1164,12 @@ fn main() {
         Language::Ja => 10,
         Language::En => 9,
     };
+    println!(
+        "    {}{} {}",
+        padded_label(label(lang, "timezone"), label_width),
+        sep,
+        tz_label
+    );
     println!(
         "    {}{} {:.2} {}",
         padded_label(label(lang, "age"), label_width),
@@ -868,21 +1195,42 @@ fn main() {
         sep,
         distance
     );
+    if !special_events.is_empty() {
+        let event_names = special_events
+            .iter()
+            .map(|event| moon_event_name(*event, lang))
+            .collect::<Vec<_>>()
+            .join(", ");
+        println!(
+            "    {}{} {}",
+            padded_label(label(lang, "event"), label_width),
+            sep,
+            event_names
+        );
+    }
     let (sunrise, sunset) = sunrise_sunset_local_on_date(year, month, day, lat, lon, tz_offset);
     if let (Some((sr_h, sr_m)), Some((ss_h, ss_m))) = (sunrise, sunset) {
-        println!(
-            "    {}{} {:02}:{:02} JST",
-            padded_label(label(lang, "sunrise"), label_width),
-            sep,
-            sr_h,
-            sr_m
+        let sunrise_text = format_event_with_azimuth(
+            (sr_h, sr_m),
+            event_azimuth(Body::Sun, target_date, (sr_h, sr_m), lat, lon, tz_offset),
+            lang,
+        );
+        let sunset_text = format_event_with_azimuth(
+            (ss_h, ss_m),
+            event_azimuth(Body::Sun, target_date, (ss_h, ss_m), lat, lon, tz_offset),
+            lang,
         );
         println!(
-            "    {}{} {:02}:{:02} JST",
+            "    {}{} {}",
+            padded_label(label(lang, "sunrise"), label_width),
+            sep,
+            sunrise_text
+        );
+        println!(
+            "    {}{} {}",
             padded_label(label(lang, "sunset"), label_width),
             sep,
-            ss_h,
-            ss_m
+            sunset_text
         );
     } else {
         println!(
@@ -897,7 +1245,11 @@ fn main() {
     let (moonrise, moonset) = moonrise_moonset_local_on_date(year, month, day, lat, lon, tz_offset);
     let fmt_moon = |opt: Option<(u32, u32)>| -> String {
         match opt {
-            Some((h, m)) => format!("{:02}:{:02} JST", h, m),
+            Some((h, m)) => format_event_with_azimuth(
+                (h, m),
+                event_azimuth(Body::Moon, target_date, (h, m), lat, lon, tz_offset),
+                lang,
+            ),
             None => "──:──".to_string(),
         }
     };
@@ -913,11 +1265,10 @@ fn main() {
 
     for (label, h, m) in &present_events {
         println!(
-            "    {}{} {:02}:{:02} JST",
+            "    {}{} {}",
             padded_label(label, label_width),
             sep,
-            h,
-            m
+            fmt_moon(Some((*h, *m)))
         );
     }
     for (label, time) in &moon_events {
@@ -929,10 +1280,6 @@ fn main() {
                 fmt_moon(*time)
             );
         }
-    }
-
-    if supermoon {
-        println!("    ** SUPER MOON **");
     }
     println!();
 }
