@@ -57,6 +57,10 @@ moon --lang en
 # Help and version
 moon --help
 moon --version
+
+# Review every day in April 2026
+powershell -ExecutionPolicy Bypass -File .\scripts\check-april-2026.ps1
+powershell -ExecutionPolicy Bypass -File .\scripts\check-april-2026.ps1 --no-art
 ```
 
 ## Options

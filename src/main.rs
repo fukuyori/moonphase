@@ -1013,6 +1013,7 @@ fn surface_texture(nx: f64, ny: f64) -> f64 {
 fn draw_moon(age: f64, width: usize, height: usize) -> Vec<String> {
     let phase = age / SYNODIC_MONTH; // 0.0〜1.0
     let waxing = phase <= 0.5;
+    let illum_frac = (1.0 - (2.0 * PI * phase).cos()) * 0.5;
 
     let cx = (width as f64 - 1.0) / 2.0;
     let cy = (height as f64 - 1.0) / 2.0;
@@ -1051,7 +1052,7 @@ fn draw_moon(age: f64, width: usize, height: usize) -> Vec<String> {
             };
 
             // 滑らかなターミネーター (sigmoid)
-            let sharpness = 5.2;
+            let sharpness = if illum_frac < 0.45 { 7.2 } else { 5.2 };
             let light = 1.0 / (1.0 + (-signed_dist * sharpness).exp());
 
             // リムダーケニング（球面効果）
@@ -1059,14 +1060,15 @@ fn draw_moon(age: f64, width: usize, height: usize) -> Vec<String> {
             let limb_factor = 0.4 + 0.6 * limb;
 
             // 月面テクスチャ
-            let texture = surface_texture(nx * 0.8, ny * 0.8) * 0.10;
+            let texture = surface_texture(nx * 0.8, ny * 0.8) * 0.08;
 
-            // 地球照
-            let earthshine = 0.05;
+            // CLI では暗部の地球照を強く出すと形が崩れて見えやすいので、
+            // 基本は使わず、明るい側の輪郭を主役にする。
+            let earthshine = 0.0;
 
             // 明るさ合成
             let base_brightness = (light * limb_factor).max(earthshine * limb_factor);
-            let brightness = (base_brightness + texture * light).clamp(0.0, 1.0);
+            let brightness = (base_brightness + texture * light.powf(2.2)).clamp(0.0, 1.0);
 
             // 輪郭アンチエイリアス（滑らかな境界）
             let edge_aa = (dist_from_edge * ry * 1.6).clamp(0.0, 1.0);
@@ -1077,10 +1079,8 @@ fn draw_moon(age: f64, width: usize, height: usize) -> Vec<String> {
                 // 月の輪郭を薄く表示（新月でも形がわかる）
                 if dist_from_edge < 0.04 {
                     '・'
-                } else if light < 0.1 {
-                    // 暗い面: かすかな地球照の表現
-                    let earthglow = earthshine * limb_factor * edge_aa;
-                    if earthglow > 0.032 { '・' } else { ' ' }
+                } else if illum_frac < 0.45 && light < 0.22 {
+                    ' '
                 } else {
                     ' '
                 }
