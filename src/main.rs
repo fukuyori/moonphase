@@ -1017,8 +1017,8 @@ fn draw_moon(age: f64, width: usize, height: usize) -> Vec<String> {
 
     let cx = (width as f64 - 1.0) / 2.0;
     let cy = (height as f64 - 1.0) / 2.0;
-    // 端末の文字セルは縦長なので、見た目で円になるよう横方向を広めに補正する。
-    let rx = cx * 1.08;
+    // 端末の文字セルは縦長だが、広げすぎると横長に崩れるので補正は控えめにする。
+    let rx = cx * 1.05;
     let ry = cy;
 
     let term_cos = (2.0 * PI * phase).cos();
@@ -1059,8 +1059,10 @@ fn draw_moon(age: f64, width: usize, height: usize) -> Vec<String> {
             let limb = (1.0 - r2).sqrt();
             let limb_factor = 0.4 + 0.6 * limb;
 
-            // 月面テクスチャ
-            let texture = surface_texture(nx * 0.8, ny * 0.8) * 0.08;
+            // 満月付近で縁にノイズが乗ると円が崩れて見えるため、
+            // テクスチャは中央寄りに限定し、満月ではかなり弱める。
+            let texture_strength = if illum_frac > 0.96 { 0.015 } else { 0.08 };
+            let texture = surface_texture(nx * 0.8, ny * 0.8) * texture_strength * limb.powf(1.8);
 
             // CLI では暗部の地球照を強く出すと形が崩れて見えやすいので、
             // 基本は使わず、明るい側の輪郭を主役にする。
@@ -1071,16 +1073,16 @@ fn draw_moon(age: f64, width: usize, height: usize) -> Vec<String> {
             let brightness = (base_brightness + texture * light.powf(2.2)).clamp(0.0, 1.0);
 
             // 輪郭アンチエイリアス（滑らかな境界）
-            let edge_aa = (dist_from_edge * ry * 1.6).clamp(0.0, 1.0);
+            let edge_softness = if illum_frac > 0.96 { 2.0 } else { 1.6 };
+            let edge_aa = (dist_from_edge * ry * edge_softness).clamp(0.0, 1.0);
             let final_brightness = brightness * edge_aa;
 
             // 暗い面の処理
             let ch = if final_brightness < 0.04 {
-                // 月の輪郭を薄く表示（新月でも形がわかる）
-                if dist_from_edge < 0.04 {
+                // 細い月で暗部の外周まで出すと円が崩れて見えるため、
+                // 輪郭は新月付近だけに限定する。
+                if illum_frac < 0.003 && dist_from_edge < 0.04 {
                     '・'
-                } else if illum_frac < 0.45 && light < 0.22 {
-                    ' '
                 } else {
                     ' '
                 }
@@ -1146,7 +1148,7 @@ fn main() {
 
     if art_enabled {
         // アスキーアート（45×21）
-        let art = draw_moon(age, 45, 21);
+        let art = draw_moon(age, 41, 21);
         let color = moon_art_color(&special_events);
         for line in &art {
             if let Some(color) = color {

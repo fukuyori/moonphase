@@ -61,6 +61,8 @@ moon --version
 # 2026年4月を通しで確認
 powershell -ExecutionPolicy Bypass -File .\scripts\check-april-2026.ps1
 powershell -ExecutionPolicy Bypass -File .\scripts\check-april-2026.ps1 --no-art
+sh ./scripts/check-april-2026.sh
+sh ./scripts/check-april-2026.sh --no-art
 ```
 
 ## オプション
