@@ -6,7 +6,7 @@ use std::path::PathBuf;
 
 #[macro_use]
 extern crate astro;
-use astro::{coords, ecliptic, lunar, nutation, sun, time as atime, transit};
+use astro::{coords, ecliptic, interpol, lunar, nutation, sun, time as atime};
 use astro::time::{CalType, Date};
 
 /// 朔望月（日）
@@ -552,19 +552,94 @@ fn lunar_metrics(jd: f64, year: i32, month: u32, day: u32) -> (f64, f64, f64) {
     (age, illum, earth_moon_dist)
 }
 
-/// astro クレートの transit::time を使って月の出・月の入りを計算
-/// 戻り値: (月の出 Option<(h,m)>, 月の入り Option<(h,m)>) UTC
-fn moonrise_moonset_utc(jd_utc_midnight: f64, lat_deg: f64, lon_deg: f64, year: i32, month: u32) -> (Option<(u32, u32)>, Option<(u32, u32)>) {
-    // `date_to_jd` は対象日の 0:00 UTC を返すので、その JD をそのまま基準日に使う。
-    // ここでさらに -0.5 すると前日 12:00 UTC 基準となり、月の出入りが大きくずれる。
-    let jd0 = jd_utc_midnight;
+/// 三連続 RA 値の 2π ラップを解消（補間の不連続を避ける）
+fn unwrap_ra_triple(r1: f64, r2: f64, r3: f64) -> (f64, f64, f64) {
+    let two_pi = 2.0 * PI;
+    let mut r1 = r1;
+    let mut r3 = r3;
+    while r1 - r2 > PI { r1 -= two_pi; }
+    while r2 - r1 > PI { r1 += two_pi; }
+    while r3 - r2 > PI { r3 -= two_pi; }
+    while r2 - r3 > PI { r3 += two_pi; }
+    (r1, r2, r3)
+}
 
-    let geograph = coords::GeographPoint {
-        long: (-lon_deg).to_radians(), // Meeus: 西経が正
-        lat: lat_deg.to_radians(),
+/// Meeus 『Astronomical Algorithms』 第15章の反復補正版で
+/// 指定 UT 日 (0h UT 基準) における出・没を計算する。
+///
+/// `eqN` は JD-1/JD/JD+1 の赤道座標。
+/// 戻り値の Option が None の日は「その UT 日内に該当イベントなし」
+/// （周極・永昼、もしくはイベントが隣の UT 日に属する）を意味する。
+fn meeus_rise_set_utc(
+    h0_std_rad: f64,
+    lat_deg: f64,
+    lon_deg: f64,
+    eq1: &coords::EqPoint,
+    eq2: &coords::EqPoint,
+    eq3: &coords::EqPoint,
+    apprnt_sidr_rad: f64,
+    delta_t_sec: f64,
+) -> (Option<(u32, u32)>, Option<(u32, u32)>) {
+    let phi = lat_deg.to_radians();
+    let l_west = (-lon_deg).to_radians();
+    let two_pi = 2.0 * PI;
+
+    let cos_big_h0 = (h0_std_rad.sin() - phi.sin() * eq2.dec.sin())
+        / (phi.cos() * eq2.dec.cos());
+    if !cos_big_h0.is_finite() || cos_big_h0.abs() > 1.0 {
+        return (None, None);
+    }
+    let big_h0 = cos_big_h0.acos();
+
+    let m0 = ((eq2.asc + l_west - apprnt_sidr_rad) / two_pi).rem_euclid(1.0);
+    let m_rise_init = (m0 - big_h0 / two_pi).rem_euclid(1.0);
+    let m_set_init  = (m0 + big_h0 / two_pi).rem_euclid(1.0);
+
+    let (a1, a2, a3) = unwrap_ra_triple(eq1.asc, eq2.asc, eq3.asc);
+    let d1 = eq1.dec;
+    let d2 = eq2.dec;
+    let d3 = eq3.dec;
+    let sidr_per_day = 360.985647_f64.to_radians();
+
+    let iterate = |m_init: f64| -> Option<(u32, u32)> {
+        let mut m = m_init;
+        for _ in 0..20 {
+            let theta = apprnt_sidr_rad + m * sidr_per_day;
+            let n = m + delta_t_sec / 86_400.0;
+            let alpha = interpol::three_values(a1, a2, a3, n);
+            let delta = interpol::three_values(d1, d2, d3, n);
+            let mut hour_angle = theta - l_west - alpha;
+            hour_angle = ((hour_angle + PI).rem_euclid(two_pi)) - PI;
+            let alt = (phi.sin() * delta.sin()
+                + phi.cos() * delta.cos() * hour_angle.cos()).asin();
+            let denom = two_pi * delta.cos() * phi.cos() * hour_angle.sin();
+            if denom.abs() < 1e-12 { return None; }
+            let dm = (alt - h0_std_rad) / denom;
+            m += dm;
+            if dm.abs() < 1e-6 { break; }
+        }
+        if !(0.0..1.0).contains(&m) {
+            return None;
+        }
+        // イベントが進行中の分を表示する慣習に合わせて floor で切り捨てる。
+        let total_min = (m * 1440.0).floor() as i64;
+        let total_min = total_min.rem_euclid(1_440);
+        Some(((total_min / 60) as u32, (total_min % 60) as u32))
     };
 
-    // 当日・前日・翌日の月の位置（0h UT 基準）
+    (iterate(m_rise_init), iterate(m_set_init))
+}
+
+/// 月の出・月の入り（UT）。存在しなければ None。
+fn moonrise_moonset_utc(
+    jd_utc_midnight: f64,
+    lat_deg: f64,
+    lon_deg: f64,
+    year: i32,
+    month: u32,
+) -> (Option<(u32, u32)>, Option<(u32, u32)>) {
+    let jd0 = jd_utc_midnight;
+
     let (eq1, _) = lunar_eq_pos(jd0 - 1.0);
     let (eq2, dist2) = lunar_eq_pos(jd0);
     let (eq3, _) = lunar_eq_pos(jd0 + 1.0);
@@ -572,30 +647,12 @@ fn moonrise_moonset_utc(jd_utc_midnight: f64, lat_deg: f64, lon_deg: f64, year: 
     let apprnt_sidr = apprnt_sidr!(jd0);
     let delta_t = atime::delta_t(year, month as u8);
     let parallax = lunar::eq_hz_parllx(dist2);
+    let refraction = (34.0_f64 / 60.0).to_radians();
+    let h0_std = 0.7275 * parallax - refraction;
 
-    let to_hm = |result: (i64, i64, f64)| -> Option<(u32, u32)> {
-        let (h, m, s) = result;
-        let total_seconds = h as f64 * 3600.0 + m as f64 * 60.0 + s;
-        let total_seconds = total_seconds.rem_euclid(86_400.0);
-        let total_minutes = (total_seconds / 60.0).floor() as u32;
-        Some((total_minutes / 60, total_minutes % 60))
-    };
-
-    let rise = to_hm(transit::time(
-        &transit::TransitType::Rise,
-        &transit::TransitBody::Moon,
-        &geograph, &eq1, &eq2, &eq3,
-        apprnt_sidr, delta_t, parallax,
-    ));
-
-    let set = to_hm(transit::time(
-        &transit::TransitType::Set,
-        &transit::TransitBody::Moon,
-        &geograph, &eq1, &eq2, &eq3,
-        apprnt_sidr, delta_t, parallax,
-    ));
-
-    (rise, set)
+    meeus_rise_set_utc(
+        h0_std, lat_deg, lon_deg, &eq1, &eq2, &eq3, apprnt_sidr, delta_t,
+    )
 }
 
 fn utc_event_to_local(
@@ -661,38 +718,16 @@ fn sunrise_sunset_utc(
     year: i32,
     month: u32,
 ) -> (Option<(u32, u32)>, Option<(u32, u32)>) {
-    let geograph = coords::GeographPoint {
-        long: (-lon_deg).to_radians(),
-        lat: lat_deg.to_radians(),
-    };
     let eq1 = solar_eq_pos(jd_utc_midnight - 1.0);
     let eq2 = solar_eq_pos(jd_utc_midnight);
     let eq3 = solar_eq_pos(jd_utc_midnight + 1.0);
     let apprnt_sidr = apprnt_sidr!(jd_utc_midnight);
     let delta_t = atime::delta_t(year, month as u8);
+    let h0_std = (-0.8333_f64).to_radians();
 
-    let to_hm = |result: (i64, i64, f64)| -> Option<(u32, u32)> {
-        let (h, m, s) = result;
-        let total_seconds = h as f64 * 3600.0 + m as f64 * 60.0 + s;
-        let total_seconds = total_seconds.rem_euclid(86_400.0);
-        let total_minutes = (total_seconds / 60.0).floor() as u32;
-        Some((total_minutes / 60, total_minutes % 60))
-    };
-
-    let rise = to_hm(transit::time(
-        &transit::TransitType::Rise,
-        &transit::TransitBody::Sun,
-        &geograph, &eq1, &eq2, &eq3,
-        apprnt_sidr, delta_t, 0.0,
-    ));
-    let set = to_hm(transit::time(
-        &transit::TransitType::Set,
-        &transit::TransitBody::Sun,
-        &geograph, &eq1, &eq2, &eq3,
-        apprnt_sidr, delta_t, 0.0,
-    ));
-
-    (rise, set)
+    meeus_rise_set_utc(
+        h0_std, lat_deg, lon_deg, &eq1, &eq2, &eq3, apprnt_sidr, delta_t,
+    )
 }
 
 fn sunrise_sunset_local_on_date(
@@ -807,11 +842,13 @@ mod tests {
 
     #[test]
     fn moonrise_moonset_tokyo_regression_2026_04_08() {
+        // 東京 2026-04-08 (JST) は月の出なしの日。前日 4/7 23:20、翌 4/9 00:12 と
+        // 約50分の遅れが跨いだ結果、当該ローカル日内に月の出は発生しない。
         let (moonrise, moonset) =
             moonrise_moonset_local_on_date(2026, 4, 8, 35.6762, 139.6503, 9.0);
 
-        assert_eq!(moonrise, Some((23, 20)));
-        assert_eq!(moonset, Some((7, 50)));
+        assert_eq!(moonrise, None);
+        assert_eq!(moonset, Some((8, 37)));
     }
 
     #[test]
@@ -819,8 +856,20 @@ mod tests {
         let (sunrise, sunset) =
             sunrise_sunset_local_on_date(2026, 4, 8, 35.6762, 139.6503, 9.0);
 
-        assert_eq!(sunrise, Some((5, 20)));
+        assert_eq!(sunrise, Some((5, 18)));
         assert_eq!(sunset, Some((18, 8)));
+    }
+
+    #[test]
+    fn moonrise_sydney_2026_04_11_no_event() {
+        // シドニー 2026-04-11 (AEST) は月の出なしの日 (USNO 確認済)。
+        // 旧実装 (astro-rust transit::time) は m 補正が1回のみで約1時間ずれた
+        // スプリアスな月の出を生成していた。Meeus 15 章の反復補正版で修正済。
+        let (moonrise, moonset) =
+            moonrise_moonset_local_on_date(2026, 4, 11, -33.8688, 151.2093, 10.0);
+
+        assert_eq!(moonrise, None);
+        assert_eq!(moonset, Some((14, 2)));
     }
 
     #[test]
