@@ -2,12 +2,15 @@ use chrono::{Datelike, Duration, FixedOffset, NaiveDate, Utc};
 use std::env;
 use std::f64::consts::PI;
 use std::fs;
+use std::io::{Read, Write};
+use std::net::{TcpStream, ToSocketAddrs};
 use std::path::PathBuf;
+use std::time::Duration as StdDuration;
 
 #[macro_use]
 extern crate astro;
-use astro::{coords, ecliptic, interpol, lunar, nutation, sun, time as atime};
 use astro::time::{CalType, Date};
+use astro::{coords, ecliptic, interpol, lunar, nutation, sun, time as atime};
 
 /// 朔望月（日）
 const SYNODIC_MONTH: f64 = 29.530588853;
@@ -34,6 +37,22 @@ struct AppConfig {
     tz_offset_minutes: i32,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ParsedArgs {
+    date: NaiveDate,
+    config: AppConfig,
+    write_config: bool,
+    detect_location: bool,
+    lat_overridden: bool,
+    lon_overridden: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct GeoCoordinates {
+    lat: f64,
+    lon: f64,
+}
+
 fn date_to_jd(year: i32, month: u32, day: u32) -> f64 {
     // グレゴリオ暦 → ユリウス日（0:00 UTC 基準）
     let (y, m) = if month <= 2 {
@@ -43,10 +62,7 @@ fn date_to_jd(year: i32, month: u32, day: u32) -> f64 {
     };
     let a = (y as f64 / 100.0).floor();
     let b = 2.0 - a + (a / 4.0).floor();
-    (365.25 * (y as f64 + 4716.0)).floor()
-        + (30.6001 * (m as f64 + 1.0)).floor()
-        + day as f64
-        + b
+    (365.25 * (y as f64 + 4716.0)).floor() + (30.6001 * (m as f64 + 1.0)).floor() + day as f64 + b
         - 1524.5
 }
 
@@ -78,8 +94,12 @@ fn parse_tz_offset(value: &str) -> Result<i32, String> {
     let Some((hour_s, minute_s)) = rest.split_once(':') else {
         return Err("timezone must be in the form `09:00`, `+09:00`, or `-05:00`".to_string());
     };
-    let hours: i32 = hour_s.parse().map_err(|_| "invalid timezone hour".to_string())?;
-    let minutes: i32 = minute_s.parse().map_err(|_| "invalid timezone minute".to_string())?;
+    let hours: i32 = hour_s
+        .parse()
+        .map_err(|_| "invalid timezone hour".to_string())?;
+    let minutes: i32 = minute_s
+        .parse()
+        .map_err(|_| "invalid timezone minute".to_string())?;
     if hours > 23 || minutes > 59 {
         return Err("timezone is out of range".to_string());
     }
@@ -100,12 +120,21 @@ fn format_tz_label(tz_offset_minutes: i32) -> String {
     format!("UTC{}{:02}:{:02}", sign, abs / 60, abs % 60)
 }
 
+fn format_tz_config_value(tz_offset_minutes: i32) -> String {
+    if tz_offset_minutes == 0 {
+        return "UTC".to_string();
+    }
+    let sign = if tz_offset_minutes < 0 { '-' } else { '+' };
+    let abs = tz_offset_minutes.abs();
+    format!("{}{:02}:{:02}", sign, abs / 60, abs % 60)
+}
+
 fn print_usage(exit_code: i32) -> ! {
     println!("moon {}", VERSION);
     println!();
     println!("Usage:");
     println!("  moon [YYYY-MM-DD|today|prev|next] [LAT LON]");
-    println!("  moon --date [YYYY-MM-DD|today|prev|next] --lat LAT --lon LON [--art|--no-art] [--lang ja|en] [--tz 09:00]");
+    println!("  moon --date [YYYY-MM-DD|today|prev|next] --lat LAT --lon LON [--art|--no-art] [--lang ja|en] [--tz 09:00] [--detect-location] [--write-config]");
     println!("  moon --help");
     println!("  moon --version");
     if let Some(path) = default_config_path() {
@@ -142,9 +171,12 @@ fn default_config_path() -> Option<PathBuf> {
             .map(PathBuf::from)
             .map(|base| base.join("moon").join("config.toml"))
     } else if cfg!(target_os = "macos") {
-        env::var_os("HOME")
-            .map(PathBuf::from)
-            .map(|base| base.join("Library").join("Application Support").join("moon").join("config.toml"))
+        env::var_os("HOME").map(PathBuf::from).map(|base| {
+            base.join("Library")
+                .join("Application Support")
+                .join("moon")
+                .join("config.toml")
+        })
     } else {
         if let Some(xdg) = env::var_os("XDG_CONFIG_HOME") {
             Some(PathBuf::from(xdg).join("moon").join("config.toml"))
@@ -236,6 +268,99 @@ fn load_app_config() -> Result<Option<AppConfig>, String> {
     Ok(Some(config))
 }
 
+fn write_app_config(config: AppConfig) -> Result<PathBuf, String> {
+    let Some(path) = default_config_path() else {
+        return Err("config file path is unavailable on this platform".to_string());
+    };
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("failed to resolve config directory for {}", path.display()))?;
+    fs::create_dir_all(parent).map_err(|e| {
+        format!(
+            "failed to create config directory ({}): {}",
+            parent.display(),
+            e
+        )
+    })?;
+    let lang = match config.lang {
+        Language::Ja => "ja",
+        Language::En => "en",
+    };
+    let content = format!(
+        "lat = {:.6}\nlon = {:.6}\nart = {}\nlang = \"{}\"\ntz = \"{}\"\n",
+        config.lat,
+        config.lon,
+        config.art,
+        lang,
+        format_tz_config_value(config.tz_offset_minutes)
+    );
+    fs::write(&path, content)
+        .map_err(|e| format!("failed to write config file ({}): {}", path.display(), e))?;
+    Ok(path)
+}
+
+fn extract_json_number(body: &str, key: &str) -> Result<f64, String> {
+    let quoted_key = format!("\"{}\"", key);
+    let key_pos = body
+        .find(&quoted_key)
+        .ok_or_else(|| format!("location response is missing `{}`", key))?;
+    let remainder = &body[key_pos + quoted_key.len()..];
+    let colon_pos = remainder
+        .find(':')
+        .ok_or_else(|| format!("location response is missing `{}:`", key))?;
+    let value = remainder[colon_pos + 1..].trim_start();
+    let end = value
+        .find(|c: char| !(c.is_ascii_digit() || matches!(c, '.' | '-' | '+' | 'e' | 'E')))
+        .unwrap_or(value.len());
+    value[..end]
+        .parse()
+        .map_err(|_| format!("location response has invalid `{}`", key))
+}
+
+fn detect_location_from_ip() -> Result<GeoCoordinates, String> {
+    let address = ("ip-api.com", 80)
+        .to_socket_addrs()
+        .map_err(|e| format!("failed to resolve location service host: {}", e))?
+        .next()
+        .ok_or_else(|| "failed to resolve location service host".to_string())?;
+    let mut stream = TcpStream::connect_timeout(&address, StdDuration::from_secs(5))
+        .map_err(|e| format!("failed to connect to location service: {}", e))?;
+    stream
+        .set_read_timeout(Some(StdDuration::from_secs(5)))
+        .map_err(|e| format!("failed to set location service read timeout: {}", e))?;
+    stream
+        .set_write_timeout(Some(StdDuration::from_secs(5)))
+        .map_err(|e| format!("failed to set location service write timeout: {}", e))?;
+    stream
+        .write_all(
+            b"GET /json HTTP/1.1\r\nHost: ip-api.com\r\nUser-Agent: moonphase\r\nConnection: close\r\n\r\n",
+        )
+        .map_err(|e| format!("failed to query location service: {}", e))?;
+
+    let mut response = String::new();
+    stream
+        .read_to_string(&mut response)
+        .map_err(|e| format!("failed to read location service response: {}", e))?;
+
+    let (_, body) = response
+        .split_once("\r\n\r\n")
+        .ok_or_else(|| "location service returned an invalid HTTP response".to_string())?;
+
+    if body.contains("\"status\":\"fail\"") {
+        let message = body
+            .split("\"message\":\"")
+            .nth(1)
+            .and_then(|rest| rest.split('"').next())
+            .unwrap_or("request failed");
+        return Err(format!("location detection failed: {}", message));
+    }
+
+    Ok(GeoCoordinates {
+        lat: extract_json_number(body, "lat")?,
+        lon: extract_json_number(body, "lon")?,
+    })
+}
+
 fn detect_cli_tz_offset(args: &[String], default_tz_offset_minutes: i32) -> Result<i32, String> {
     let mut tz_offset_minutes = default_tz_offset_minutes;
     let mut i = 1;
@@ -259,13 +384,17 @@ fn parse_cli_args(
     args: &[String],
     base_date: NaiveDate,
     default_config: AppConfig,
-) -> Result<(NaiveDate, f64, f64, bool, Language, i32), String> {
+) -> Result<ParsedArgs, String> {
     let mut date = base_date;
     let mut lat = default_config.lat;
     let mut lon = default_config.lon;
     let mut art = default_config.art;
     let mut lang = default_config.lang;
     let mut tz_offset_minutes = default_config.tz_offset_minutes;
+    let mut write_config = false;
+    let mut detect_location = false;
+    let mut lat_overridden = false;
+    let mut lon_overridden = false;
 
     let mut positional = Vec::new();
     let mut i = 1;
@@ -286,6 +415,7 @@ fn parse_cli_args(
                 lat = args[i]
                     .parse()
                     .map_err(|_| "invalid latitude".to_string())?;
+                lat_overridden = true;
             }
             "--lon" => {
                 i += 1;
@@ -295,6 +425,7 @@ fn parse_cli_args(
                 lon = args[i]
                     .parse()
                     .map_err(|_| "invalid longitude".to_string())?;
+                lon_overridden = true;
             }
             "--lang" => {
                 i += 1;
@@ -316,6 +447,12 @@ fn parse_cli_args(
             "--no-art" => {
                 art = false;
             }
+            "--write-config" => {
+                write_config = true;
+            }
+            "--detect-location" => {
+                detect_location = true;
+            }
             "--help" | "-h" => print_usage(0),
             "--version" | "-V" => print_version_and_exit(),
             arg if arg.starts_with("--") => {
@@ -333,17 +470,28 @@ fn parse_cli_args(
         }
         [date_spec, lat_s, lon_s] => {
             date = resolve_date_spec(base_date, date_spec)?;
-            lat = lat_s
-                .parse()
-                .map_err(|_| "invalid latitude".to_string())?;
-            lon = lon_s
-                .parse()
-                .map_err(|_| "invalid longitude".to_string())?;
+            lat = lat_s.parse().map_err(|_| "invalid latitude".to_string())?;
+            lon = lon_s.parse().map_err(|_| "invalid longitude".to_string())?;
+            lat_overridden = true;
+            lon_overridden = true;
         }
         _ => return Err("invalid number of arguments".to_string()),
     }
 
-    Ok((date, lat, lon, art, lang, tz_offset_minutes))
+    Ok(ParsedArgs {
+        date,
+        config: AppConfig {
+            lat,
+            lon,
+            art,
+            lang,
+            tz_offset_minutes,
+        },
+        write_config,
+        detect_location,
+        lat_overridden,
+        lon_overridden,
+    })
 }
 
 /// スーパームーン判定
@@ -361,11 +509,7 @@ fn is_micromoon(age: f64, distance: f64) -> bool {
 }
 
 fn nearest_full_moon_jd(date: NaiveDate, tz_offset_hours: f64) -> f64 {
-    let probe_dates = [
-        date + Duration::days(-20),
-        date,
-        date + Duration::days(20),
-    ];
+    let probe_dates = [date + Duration::days(-20), date, date + Duration::days(20)];
     let mut candidates = Vec::new();
     for probe in probe_dates {
         let probe_date = Date {
@@ -375,7 +519,10 @@ fn nearest_full_moon_jd(date: NaiveDate, tz_offset_hours: f64) -> f64 {
             cal_type: CalType::Gregorian,
         };
         let full_jd = lunar::time_of_phase(&probe_date, &lunar::Phase::Full);
-        if !candidates.iter().any(|existing: &f64| (existing - full_jd).abs() < 0.1) {
+        if !candidates
+            .iter()
+            .any(|existing: &f64| (existing - full_jd).abs() < 0.1)
+        {
             candidates.push(full_jd);
         }
     }
@@ -422,11 +569,7 @@ fn is_blue_moon(date: NaiveDate, current_full_jd: f64, tz_offset_hours: f64) -> 
         return false;
     }
 
-    let probe_dates = [
-        date + Duration::days(-20),
-        date,
-        date + Duration::days(20),
-    ];
+    let probe_dates = [date + Duration::days(-20), date, date + Duration::days(20)];
     let mut candidates = Vec::new();
     for probe in probe_dates {
         let probe_date = Date {
@@ -436,7 +579,10 @@ fn is_blue_moon(date: NaiveDate, current_full_jd: f64, tz_offset_hours: f64) -> 
             cal_type: CalType::Gregorian,
         };
         let full_jd = lunar::time_of_phase(&probe_date, &lunar::Phase::Full);
-        if !candidates.iter().any(|existing: &f64| (existing - full_jd).abs() < 0.1) {
+        if !candidates
+            .iter()
+            .any(|existing: &f64| (existing - full_jd).abs() < 0.1)
+        {
             candidates.push(full_jd);
         }
     }
@@ -520,9 +666,8 @@ fn lunar_metrics(jd: f64, year: i32, month: u32, day: u32) -> (f64, f64, f64) {
         decimal_day: day as f64,
         cal_type: CalType::Gregorian,
     };
-    let prev_probe_date = NaiveDate::from_ymd_opt(year, month, day)
-        .expect("valid date")
-        + Duration::days(-15);
+    let prev_probe_date =
+        NaiveDate::from_ymd_opt(year, month, day).expect("valid date") + Duration::days(-15);
     let prev_date = Date {
         year: prev_probe_date.year() as i16,
         month: prev_probe_date.month() as u8,
@@ -557,10 +702,18 @@ fn unwrap_ra_triple(r1: f64, r2: f64, r3: f64) -> (f64, f64, f64) {
     let two_pi = 2.0 * PI;
     let mut r1 = r1;
     let mut r3 = r3;
-    while r1 - r2 > PI { r1 -= two_pi; }
-    while r2 - r1 > PI { r1 += two_pi; }
-    while r3 - r2 > PI { r3 -= two_pi; }
-    while r2 - r3 > PI { r3 += two_pi; }
+    while r1 - r2 > PI {
+        r1 -= two_pi;
+    }
+    while r2 - r1 > PI {
+        r1 += two_pi;
+    }
+    while r3 - r2 > PI {
+        r3 -= two_pi;
+    }
+    while r2 - r3 > PI {
+        r3 += two_pi;
+    }
     (r1, r2, r3)
 }
 
@@ -584,8 +737,7 @@ fn meeus_rise_set_utc(
     let l_west = (-lon_deg).to_radians();
     let two_pi = 2.0 * PI;
 
-    let cos_big_h0 = (h0_std_rad.sin() - phi.sin() * eq2.dec.sin())
-        / (phi.cos() * eq2.dec.cos());
+    let cos_big_h0 = (h0_std_rad.sin() - phi.sin() * eq2.dec.sin()) / (phi.cos() * eq2.dec.cos());
     if !cos_big_h0.is_finite() || cos_big_h0.abs() > 1.0 {
         return (None, None);
     }
@@ -593,7 +745,7 @@ fn meeus_rise_set_utc(
 
     let m0 = ((eq2.asc + l_west - apprnt_sidr_rad) / two_pi).rem_euclid(1.0);
     let m_rise_init = (m0 - big_h0 / two_pi).rem_euclid(1.0);
-    let m_set_init  = (m0 + big_h0 / two_pi).rem_euclid(1.0);
+    let m_set_init = (m0 + big_h0 / two_pi).rem_euclid(1.0);
 
     let (a1, a2, a3) = unwrap_ra_triple(eq1.asc, eq2.asc, eq3.asc);
     let d1 = eq1.dec;
@@ -610,13 +762,16 @@ fn meeus_rise_set_utc(
             let delta = interpol::three_values(d1, d2, d3, n);
             let mut hour_angle = theta - l_west - alpha;
             hour_angle = ((hour_angle + PI).rem_euclid(two_pi)) - PI;
-            let alt = (phi.sin() * delta.sin()
-                + phi.cos() * delta.cos() * hour_angle.cos()).asin();
+            let alt = (phi.sin() * delta.sin() + phi.cos() * delta.cos() * hour_angle.cos()).asin();
             let denom = two_pi * delta.cos() * phi.cos() * hour_angle.sin();
-            if denom.abs() < 1e-12 { return None; }
+            if denom.abs() < 1e-12 {
+                return None;
+            }
             let dm = (alt - h0_std_rad) / denom;
             m += dm;
-            if dm.abs() < 1e-6 { break; }
+            if dm.abs() < 1e-6 {
+                break;
+            }
         }
         if !(0.0..1.0).contains(&m) {
             return None;
@@ -651,7 +806,14 @@ fn moonrise_moonset_utc(
     let h0_std = 0.7275 * parallax - refraction;
 
     meeus_rise_set_utc(
-        h0_std, lat_deg, lon_deg, &eq1, &eq2, &eq3, apprnt_sidr, delta_t,
+        h0_std,
+        lat_deg,
+        lon_deg,
+        &eq1,
+        &eq2,
+        &eq3,
+        apprnt_sidr,
+        delta_t,
     )
 }
 
@@ -677,21 +839,15 @@ fn moonrise_moonset_local_on_date(
     lon_deg: f64,
     tz_offset_hours: f64,
 ) -> (Option<(u32, u32)>, Option<(u32, u32)>) {
-    let target_date = NaiveDate::from_ymd_opt(year, month, day)
-        .expect("valid local date");
+    let target_date = NaiveDate::from_ymd_opt(year, month, day).expect("valid local date");
     let mut moonrise = None;
     let mut moonset = None;
 
     for delta in -1..=1 {
         let utc_date = target_date + Duration::days(delta);
         let jd = date_to_jd(utc_date.year(), utc_date.month(), utc_date.day());
-        let (rise_utc, set_utc) = moonrise_moonset_utc(
-            jd,
-            lat_deg,
-            lon_deg,
-            utc_date.year(),
-            utc_date.month(),
-        );
+        let (rise_utc, set_utc) =
+            moonrise_moonset_utc(jd, lat_deg, lon_deg, utc_date.year(), utc_date.month());
 
         if let Some(utc_hm) = rise_utc {
             let (local_date, local_hm) = utc_event_to_local(utc_date, utc_hm, tz_offset_hours);
@@ -726,7 +882,14 @@ fn sunrise_sunset_utc(
     let h0_std = (-0.8333_f64).to_radians();
 
     meeus_rise_set_utc(
-        h0_std, lat_deg, lon_deg, &eq1, &eq2, &eq3, apprnt_sidr, delta_t,
+        h0_std,
+        lat_deg,
+        lon_deg,
+        &eq1,
+        &eq2,
+        &eq3,
+        apprnt_sidr,
+        delta_t,
     )
 }
 
@@ -738,21 +901,15 @@ fn sunrise_sunset_local_on_date(
     lon_deg: f64,
     tz_offset_hours: f64,
 ) -> (Option<(u32, u32)>, Option<(u32, u32)>) {
-    let target_date = NaiveDate::from_ymd_opt(year, month, day)
-        .expect("valid local date");
+    let target_date = NaiveDate::from_ymd_opt(year, month, day).expect("valid local date");
     let mut sunrise = None;
     let mut sunset = None;
 
     for delta in -1..=1 {
         let utc_date = target_date + Duration::days(delta);
         let jd = date_to_jd(utc_date.year(), utc_date.month(), utc_date.day());
-        let (rise_utc, set_utc) = sunrise_sunset_utc(
-            jd,
-            lat_deg,
-            lon_deg,
-            utc_date.year(),
-            utc_date.month(),
-        );
+        let (rise_utc, set_utc) =
+            sunrise_sunset_utc(jd, lat_deg, lon_deg, utc_date.year(), utc_date.month());
 
         if let Some(utc_hm) = rise_utc {
             let (local_date, local_hm) = utc_event_to_local(utc_date, utc_hm, tz_offset_hours);
@@ -814,11 +971,7 @@ fn event_azimuth(
     azimuth_from_eq(eq, lat_deg, lon_deg, jd)
 }
 
-fn format_event_with_azimuth(
-    hm: (u32, u32),
-    azimuth_deg: f64,
-    lang: Language,
-) -> String {
+fn format_event_with_azimuth(hm: (u32, u32), azimuth_deg: f64, lang: Language) -> String {
     match lang {
         Language::Ja => format!("{:02}:{:02}（{:03.0}°）", hm.0, hm.1, azimuth_deg),
         Language::En => format!("{:02}:{:02} ({:03.0}°)", hm.0, hm.1, azimuth_deg),
@@ -830,9 +983,10 @@ mod tests {
     use chrono::NaiveDate;
 
     use super::{
-        date_to_jd, format_event_with_azimuth, moon_art_color, moonrise_moonset_local_on_date,
-        parse_app_config, parse_language, resolve_date_spec, AppConfig, Language, MoonEvent,
-        sunrise_sunset_local_on_date,
+        date_to_jd, extract_json_number, format_event_with_azimuth, format_tz_config_value,
+        moon_art_color, moonrise_moonset_local_on_date, parse_app_config, parse_cli_args,
+        parse_language, resolve_date_spec, sunrise_sunset_local_on_date, AppConfig, Language,
+        MoonEvent,
     };
 
     #[test]
@@ -853,8 +1007,7 @@ mod tests {
 
     #[test]
     fn sunrise_sunset_tokyo_regression_2026_04_08() {
-        let (sunrise, sunset) =
-            sunrise_sunset_local_on_date(2026, 4, 8, 35.6762, 139.6503, 9.0);
+        let (sunrise, sunset) = sunrise_sunset_local_on_date(2026, 4, 8, 35.6762, 139.6503, 9.0);
 
         assert_eq!(sunrise, Some((5, 18)));
         assert_eq!(sunset, Some((18, 8)));
@@ -876,15 +1029,22 @@ mod tests {
     fn relative_date_keywords_use_local_day() {
         let base = NaiveDate::from_ymd_opt(2026, 4, 8).unwrap();
         assert_eq!(resolve_date_spec(base, "today").unwrap(), base);
-        assert_eq!(resolve_date_spec(base, "prev").unwrap(), NaiveDate::from_ymd_opt(2026, 4, 7).unwrap());
-        assert_eq!(resolve_date_spec(base, "next").unwrap(), NaiveDate::from_ymd_opt(2026, 4, 9).unwrap());
+        assert_eq!(
+            resolve_date_spec(base, "prev").unwrap(),
+            NaiveDate::from_ymd_opt(2026, 4, 7).unwrap()
+        );
+        assert_eq!(
+            resolve_date_spec(base, "next").unwrap(),
+            NaiveDate::from_ymd_opt(2026, 4, 9).unwrap()
+        );
     }
 
     #[test]
     fn app_config_parses_lat_lon_and_art() {
-        let config =
-            parse_app_config("lat = 34.6937\nlon = 135.5023\nart = false\nlang = \"en\"\ntz = \"+00:00\"\n")
-                .unwrap();
+        let config = parse_app_config(
+            "lat = 34.6937\nlon = 135.5023\nart = false\nlang = \"en\"\ntz = \"+00:00\"\n",
+        )
+        .unwrap();
         assert_eq!(
             config,
             AppConfig {
@@ -901,6 +1061,71 @@ mod tests {
     fn parse_language_supports_ja_and_en() {
         assert_eq!(parse_language("ja").unwrap(), Language::Ja);
         assert_eq!(parse_language("en").unwrap(), Language::En);
+    }
+
+    #[test]
+    fn parse_cli_args_supports_write_config() {
+        let base = NaiveDate::from_ymd_opt(2026, 4, 8).unwrap();
+        let parsed = parse_cli_args(
+            &[
+                "moon".to_string(),
+                "--date".to_string(),
+                "today".to_string(),
+                "--lat".to_string(),
+                "34.0".to_string(),
+                "--lon".to_string(),
+                "135.0".to_string(),
+                "--write-config".to_string(),
+            ],
+            base,
+            AppConfig {
+                lat: 35.6762,
+                lon: 139.6503,
+                art: true,
+                lang: Language::Ja,
+                tz_offset_minutes: 540,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(parsed.date, base);
+        assert_eq!(parsed.config.lat, 34.0);
+        assert_eq!(parsed.config.lon, 135.0);
+        assert!(parsed.write_config);
+        assert!(!parsed.detect_location);
+    }
+
+    #[test]
+    fn parse_cli_args_supports_detect_location() {
+        let base = NaiveDate::from_ymd_opt(2026, 4, 8).unwrap();
+        let parsed = parse_cli_args(
+            &[
+                "moon".to_string(),
+                "--detect-location".to_string(),
+                "--write-config".to_string(),
+            ],
+            base,
+            AppConfig {
+                lat: 35.6762,
+                lon: 139.6503,
+                art: true,
+                lang: Language::Ja,
+                tz_offset_minutes: 540,
+            },
+        )
+        .unwrap();
+
+        assert!(parsed.detect_location);
+        assert!(parsed.write_config);
+        assert!(!parsed.lat_overridden);
+        assert!(!parsed.lon_overridden);
+    }
+
+    #[test]
+    fn format_tz_config_value_uses_expected_syntax() {
+        assert_eq!(format_tz_config_value(540), "+09:00");
+        assert_eq!(format_tz_config_value(-300), "-05:00");
+        assert_eq!(format_tz_config_value(0), "UTC");
     }
 
     #[test]
@@ -922,6 +1147,13 @@ mod tests {
             Some("\x1b[94m")
         );
         assert_eq!(moon_art_color(&[MoonEvent::MicroMoon]), Some("\x1b[96m"));
+    }
+
+    #[test]
+    fn extract_json_number_reads_location_values() {
+        let body = r#"{"status":"success","lat":35.6762,"lon":139.6503}"#;
+        assert_eq!(extract_json_number(body, "lat").unwrap(), 35.6762);
+        assert_eq!(extract_json_number(body, "lon").unwrap(), 139.6503);
     }
 }
 
@@ -1173,14 +1405,48 @@ fn main() {
     };
     let local_tz = fixed_offset_from_minutes(tz_offset_minutes);
     let today_local = Utc::now().with_timezone(&local_tz).date_naive();
-    let (date, lat, lon, art_enabled, lang, tz_offset_minutes) =
-        match parse_cli_args(&args, today_local, default_config) {
+    let mut parsed_args = match parse_cli_args(&args, today_local, default_config) {
         Ok(values) => values,
         Err(message) => {
             eprintln!("{}", message);
             print_usage(1);
         }
-        };
+    };
+    if parsed_args.detect_location {
+        match detect_location_from_ip() {
+            Ok(coords) => {
+                if !parsed_args.lat_overridden {
+                    parsed_args.config.lat = coords.lat;
+                }
+                if !parsed_args.lon_overridden {
+                    parsed_args.config.lon = coords.lon;
+                }
+                eprintln!(
+                    "detected location from IP: lat={:.4}, lon={:.4}",
+                    coords.lat, coords.lon
+                );
+            }
+            Err(message) => {
+                eprintln!("{}", message);
+                std::process::exit(1);
+            }
+        }
+    }
+    if parsed_args.write_config {
+        match write_app_config(parsed_args.config) {
+            Ok(path) => eprintln!("saved config to {}", path.display()),
+            Err(message) => {
+                eprintln!("{}", message);
+                std::process::exit(1);
+            }
+        }
+    }
+    let date = parsed_args.date;
+    let lat = parsed_args.config.lat;
+    let lon = parsed_args.config.lon;
+    let art_enabled = parsed_args.config.art;
+    let lang = parsed_args.config.lang;
+    let tz_offset_minutes = parsed_args.config.tz_offset_minutes;
     let year = date.year();
     let month = date.month();
     let day = date.day();

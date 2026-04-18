@@ -4,6 +4,8 @@
 
 月齢、月相、日の出・日の入り、月の出・月の入りを表示するコマンドラインツールです。必要に応じて、墨絵風のアスキーアートも表示できます。
 
+現在のバージョン: `0.9.6`
+
 あわせて: [CHANGELOG](CHANGELOG.md)
 
 ## 特長
@@ -21,6 +23,42 @@ cargo build --release
 ```
 
 バイナリは `target/release/moon` に生成されます。Windows では `moon.exe` です。
+
+## macOS の Developer ID 配布
+
+Mac App Store 外で配布するために、`Developer ID Application` でリリースバイナリへ署名し、ZIP を notarization に送る補助スクリプトを同梱しています。
+
+前提:
+
+- macOS と Xcode のコマンドラインツールが入っていること
+- キーチェーンに `Developer ID Application` 証明書があること
+- `xcrun notarytool store-credentials` で notarytool 用のキーチェーンプロファイルを作成済みであること
+
+例:
+
+```bash
+export CODESIGN_IDENTITY="Developer ID Application: Noriaki Fukuyori (Q6GG27UYG5)"
+export NOTARY_PROFILE="moon-notary"
+
+sh ./scripts/sign-and-notarize-macos.sh sign
+sh ./scripts/sign-and-notarize-macos.sh notarize
+```
+
+まとめて実行する場合:
+
+```bash
+export CODESIGN_IDENTITY="Developer ID Application: Noriaki Fukuyori (Q6GG27UYG5)"
+export NOTARY_PROFILE="moon-notary"
+
+sh ./scripts/sign-and-notarize-macos.sh all
+```
+
+成果物は `dist/macos/` に出力されます。
+
+補足:
+
+- 現在のワークフローは CLI の単体バイナリへ署名し、ZIP アーカイブを notarization に送ります。
+- Apple は単体バイナリや ZIP へは ticket を staple できないため、この配布形態ではオンラインの notarization 確認に依存します。
 
 ## 使い方
 
@@ -41,6 +79,13 @@ moon 2026-04-08 35.6762 139.6503
 
 # オプション形式
 moon --date 2026-04-08 --lat 35.6762 --lon 139.6503
+
+# 現在の座標と表示設定を config.toml に保存
+moon --lat 35.6762 --lon 139.6503 --write-config
+
+# グローバルIPから概算の座標を取得
+moon --detect-location
+moon --detect-location --write-config
 
 # タイムゾーンオフセット
 moon --tz 09:00
@@ -74,6 +119,8 @@ sh ./scripts/check-april-2026.sh --no-art
 - `--no-art`
 - `--lang <ja|en>`
 - `--tz <09:00|+09:00|-05:00|UTC>`
+- `--detect-location`
+- `--write-config`
 - `--help`
 - `--version`
 
@@ -107,6 +154,10 @@ tz = "09:00"
 ```
 
 コマンドラインで指定した値は、設定ファイルより優先されます。
+
+`--detect-location` を付けると、グローバルIPアドレスから概算の緯度経度を取得します。ネット接続が必要で、GPS や OS のネイティブ位置情報より精度は低くなります。
+
+`--write-config` を付けると、その実行で解決された `lat` / `lon` / `art` / `lang` / `tz` を設定ファイルへ保存してから結果を表示します。
 
 ## 出力例
 

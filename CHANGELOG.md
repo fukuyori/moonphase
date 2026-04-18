@@ -2,6 +2,20 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.6] - 2026-04-18
+
+### Added
+
+- Added `--detect-location` to resolve approximate coordinates from the public IP address
+- Added `--write-config` to persist the resolved coordinates and display settings to `config.toml`
+- Added `scripts/sign-and-notarize-macos.sh` to support macOS Developer ID signing and notarization
+- Added documentation for direct macOS distribution outside the Mac App Store
+
+### Changed
+
+- Expanded the bilingual READMEs to cover location detection and config writing workflows
+- Updated the CLI help and configuration output handling for the new options
+
 ## [0.9.2] - 2026-04-09
 
 ### Added

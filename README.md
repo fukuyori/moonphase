@@ -4,6 +4,8 @@
 
 `moon` is a command-line tool that shows moon age, phase, sunrise, sunset, moonrise, moonset, and optional ASCII moon art.
 
+Current version: `0.9.6`
+
 See also: [CHANGELOG](CHANGELOG.md)
 
 ## Features
@@ -21,6 +23,42 @@ cargo build --release
 ```
 
 The binary will be created at `target/release/moon`. On Windows, the file is `moon.exe`.
+
+## macOS Developer ID Distribution
+
+For direct distribution outside the Mac App Store, this repository includes a helper script for signing the release binary with `Developer ID Application` and submitting a ZIP archive for notarization.
+
+Prerequisites:
+
+- macOS with Xcode command line tools
+- A `Developer ID Application` certificate in your keychain
+- A `notarytool` keychain profile created with `xcrun notarytool store-credentials`
+
+Example:
+
+```bash
+export CODESIGN_IDENTITY="Developer ID Application: Noriaki Fukuyori (Q6GG27UYG5)"
+export NOTARY_PROFILE="moon-notary"
+
+sh ./scripts/sign-and-notarize-macos.sh sign
+sh ./scripts/sign-and-notarize-macos.sh notarize
+```
+
+Or run both steps at once:
+
+```bash
+export CODESIGN_IDENTITY="Developer ID Application: Noriaki Fukuyori (Q6GG27UYG5)"
+export NOTARY_PROFILE="moon-notary"
+
+sh ./scripts/sign-and-notarize-macos.sh all
+```
+
+Artifacts are written to `dist/macos/`.
+
+Note:
+
+- The current workflow signs the standalone CLI binary and notarizes a ZIP archive.
+- Apple does not staple tickets to standalone binaries or ZIP archives, so this flow relies on online notarization checks.
 
 ## Usage
 
@@ -41,6 +79,13 @@ moon 2026-04-08 35.6762 139.6503
 
 # Option form
 moon --date 2026-04-08 --lat 35.6762 --lon 139.6503
+
+# Save the current coordinates and display settings to config.toml
+moon --lat 35.6762 --lon 139.6503 --write-config
+
+# Detect approximate coordinates from your public IP
+moon --detect-location
+moon --detect-location --write-config
 
 # Timezone offset
 moon --tz 09:00
@@ -74,6 +119,8 @@ sh ./scripts/check-april-2026.sh --no-art
 - `--no-art`
 - `--lang <ja|en>`
 - `--tz <09:00|+09:00|-05:00|UTC>`
+- `--detect-location`
+- `--write-config`
 - `--help`
 - `--version`
 
@@ -107,6 +154,10 @@ tz = "09:00"
 ```
 
 Command-line values override the config file.
+
+Use `--detect-location` to resolve approximate coordinates from your public IP address. This requires network access and is less precise than device GPS or OS-native location services.
+
+Use `--write-config` to persist the currently resolved `lat`, `lon`, `art`, `lang`, and `tz` values into the config file before showing the result.
 
 ## Example Output
 
